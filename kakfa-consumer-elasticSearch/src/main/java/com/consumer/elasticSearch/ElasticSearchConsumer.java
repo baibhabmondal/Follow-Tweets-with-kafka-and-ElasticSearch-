@@ -11,6 +11,8 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.serialization.StringDeserializer;
+import org.elasticsearch.action.bulk.BulkRequest;
+import org.elasticsearch.action.bulk.BulkResponse;
 import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.action.index.IndexResponse;
 import org.elasticsearch.client.RequestOptions;
@@ -64,6 +66,10 @@ public class ElasticSearchConsumer {
         properties.setProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
         properties.setProperty(ConsumerConfig.GROUP_ID_CONFIG, groupId);
 
+        // for manual commits to kafka
+        properties.setProperty(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        properties.setProperty(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, "20");
+
         // create consumer
         KafkaConsumer<String, String> consumer = new KafkaConsumer<String, String>(properties);
 
@@ -93,24 +99,39 @@ public class ElasticSearchConsumer {
         // poll
         while(true) {
             ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+
+            Integer recordCount = records.count();
+
+            logger.info("Received " + recordCount + " records");
+
+            BulkRequest bulkRequest = new BulkRequest();
+
             for(ConsumerRecord<String, String> record : records) {
 
-                String req_id = extractId(record.value());
+                // for handling null pointer exception due to id_str == null
+                try {
+                    String req_id = extractId(record.value());
+                    // insert values into the elasticSearch cluster (BONSAI)
+                    IndexRequest request = new IndexRequest("twitter");
+                    request.id(req_id);
+                    request.source(record.value(), XContentType.JSON);
+                    bulkRequest.add(request);
+                } catch (NullPointerException e) {
+                    logger.warn("Received bad data: " + record.value());
+                }
+            }
 
-                // insert values into the elasticSearch cluster (BONSAI)
-                IndexRequest request = new IndexRequest("twitter");
-                request.id(req_id);
-                request.source(record.value(), XContentType.JSON);
-                IndexResponse indexResponse = client.index(request, RequestOptions.DEFAULT);
-                String id = indexResponse.getId();
-                logger.info(id);
+            if(recordCount > 0) {
+                BulkResponse bulkResponse = client.bulk(bulkRequest, RequestOptions.DEFAULT);
+                logger.info("Commiting");
+                consumer.commitSync();
                 try {
                     Thread.sleep(1000);
                 } catch (InterruptedException e) {
                     e.printStackTrace();
                 }
+                logger.info("Commited");
             }
-
         }
 
         // close
